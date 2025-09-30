@@ -1,44 +1,41 @@
 // api/ingest.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { fetchByIMO, NormalizedVessel } from '../lib/ais.js';
+import { fetchByIMO } from '../lib/ais.js';
 import { kvSet } from './kv.js';
 
-declare global { // fallback memória
-  // eslint-disable-next-line no-var
-  var __LINEUP__: Map<string, NormalizedVessel> | undefined;
-}
+declare global { var __LINEUP__: Map<string, any> | undefined; }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // CORS p/ funcionar no Framer
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
   try {
     const apiKey = process.env.AISSTREAM_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "Missing AISSTREAM_API_KEY" });
 
-    const { imo, mmsi, name } = (typeof req.body === 'object' ? req.body : JSON.parse(String(req.body||"{}"))) as { imo?: string; mmsi?: string; name?: string; };
-    if (!imo && !mmsi && !name) {
-      return res.status(400).json({ error: "Provide at least one: imo | mmsi | name" });
+    // 👇 Agora funciona por POST (body) OU por GET (?imo=XXXX)
+    let imo = "";
+    if (req.method === "GET") {
+      imo = String(req.query.imo || "");
+    } else if (req.method === "POST") {
+      const body = typeof req.body === 'object' ? req.body : JSON.parse(String(req.body||"{}"));
+      imo = String(body?.imo || "");
+    } else {
+      return res.status(405).json({ error: "Use GET or POST" });
     }
 
-    let vessel: NormalizedVessel | null = null;
+    if (!imo) return res.status(400).json({ error: "Informe o IMO (ex.: 9412634)" });
 
-    if (imo) {
-      vessel = await fetchByIMO(apiKey, String(imo));
-    } else if (mmsi) {
-      // melhoria futura: fetch por MMSI direto (similar a fetchByIMO)
-      vessel = await fetchByIMO(apiKey, ""); // placeholder
-    } else if (name) {
-      // melhoria futura: fetch por nome (pode gerar falsos positivos)
-      vessel = await fetchByIMO(apiKey, ""); // placeholder
-    }
-
-    if (!vessel) return res.status(404).json({ error: "AIS not found for given input (try IMO)" });
+    const vessel = await fetchByIMO(apiKey, imo);
+    if (!vessel) return res.status(404).json({ error: "AIS não encontrado para este IMO" });
 
     const key = vessel.imo || vessel.mmsi || vessel.vesselName || `vessel:${Date.now()}`;
     const saved = await kvSet(`vessel:${key}`, vessel);
     if (!saved) {
-      global.__LINEUP__ ||= new Map<string, NormalizedVessel>();
+      global.__LINEUP__ ||= new Map<string, any>();
       global.__LINEUP__.set(key, vessel);
     }
     return res.status(200).json(vessel);
