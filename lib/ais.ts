@@ -1,4 +1,4 @@
-// lib/ais.ts — VERSÃO ROBUSTA
+// lib/ais.ts — versão robusta (escuta ampla e mais tempo)
 import WebSocket from "ws";
 import { flagFromMMSI } from "./mid.js";
 import { mapShipTypeToText } from "./shiptype.js";
@@ -22,7 +22,7 @@ export type NormalizedVessel = {
 
 const WSS = "wss://stream.aisstream.io/v0/stream";
 
-// -------- utils
+// ---- utils
 function pad2(n: number){ return n<10?`0${n}`:`${n}`; }
 function formatEta(eta: any): string | null {
   if (!eta) return null;
@@ -46,47 +46,7 @@ function navStatusText(code: any): string | null {
   return map[c] ?? `Code ${c}`;
 }
 
-// -------- assinatura genérica no stream
-function subscribe(ws: WebSocket, apiKey: string, extra: Record<string, any> = {}) {
-  // Colocamos a key na query (ao abrir) e também no corpo abaixo,
-  // porque alguns exemplos do AISStream aceitam "Apikey" e outros "APIKey".
-  const msg = {
-    Apikey: apiKey,
-    APIKey: apiKey,
-    BoundingBoxes: [[[-90,-180],[90,180]]],
-    ...extra
-  };
-  ws.send(JSON.stringify(msg));
-}
-
-// -------- aguarda mensagens até bater o predicate (ou timeout)
-async function waitUntil<T>(
-  apiKey: string,
-  extraSubscribe: Record<string, any>,
-  predicate: (m: any) => T | null,
-  timeoutMs = 15000
-): Promise<T | null> {
-  return new Promise((resolve) => {
-    // importa a key também na URL (compatibilidade)
-    const ws = new WebSocket(`${WSS}?apikey=${encodeURIComponent(apiKey)}`);
-    let done = false;
-    const finish = (val: T | null) => { if (done) return; done = true; try{ws.close();}catch{} resolve(val); };
-    const timer = setTimeout(() => finish(null), timeoutMs);
-
-    ws.on("open", () => subscribe(ws, apiKey, extraSubscribe));
-    ws.on("message", (buf) => {
-      try {
-        const data = JSON.parse(buf.toString());
-        const match = predicate(data);
-        if (match) { clearTimeout(timer); finish(match); }
-      } catch { /* ignora pacotes inválidos */ }
-    });
-    ws.on("error", () => finish(null));
-    ws.on("close", () => finish(null));
-  });
-}
-
-// -------- parser defensivo
+// ---- parsers defensivos
 function parseStatic(msg: any) {
   const type = msg?.MessageType || msg?.messageType;
   if (String(type).toLowerCase() !== "shipstaticdata") return null;
@@ -127,49 +87,71 @@ function parsePosition(msg: any) {
   return navStatusText(body?.NavigationalStatus);
 }
 
-// -------- API principal: IMO -> dados
-export async function fetchByIMO(apiKey: string, imoWant: string): Promise<NormalizedVessel | null> {
-  // 1) ShipStaticData com o IMO pedido
-  const staticHit = await waitUntil(
-    apiKey,
-    { FilterMessageTypes: ["ShipStaticData"] },
-    (m) => {
-      const s = parseStatic(m);
-      if (!s || !s.imo) return null;
-      if (String(s.imo) !== String(imoWant)) return null;
-      const v: NormalizedVessel = {
-        vesselName: s.vesselName,
-        imo: s.imo,
-        mmsi: s.mmsi,
-        flag: s.mmsi ? flagFromMMSI(s.mmsi) : null,
-        generalType: s.generalType,
-        detailedType: s.detailedType,
-        departedFrom: null,
-        arrivalAt: s.arrivalAt,
-        navStatus: null,
-        atd: null,
-        ata: null,
-        reportedEta: s.reportedEta,
-        source: "AISStream",
-        fetchedAt: new Date().toISOString()
-      };
-      return v;
-    },
-    20000 // espera até 20s para achar o IMO certo
-  );
+// ---- abre o WS e escuta até o predicate ser atendido (ou timeout)
+async function waitUntil<T>(
+  apiKey: string,
+  predicate: (m: any) => T | null,
+  timeoutMs: number
+): Promise<T | null> {
+  return new Promise((resolve) => {
+    // também enviaremos a key na query para máxima compatibilidade
+    const ws = new WebSocket(`${WSS}?apikey=${encodeURIComponent(apiKey)}`);
+    let done = false;
+    const finish = (val: T | null) => { if (done) return; done = true; try{ws.close();}catch{} resolve(val); };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    ws.on("open", () => {
+      // assinatura mínima, sem filtros (recebe o mundo)
+      const msg = { APIKey: apiKey, Apikey: apiKey, BoundingBoxes: [[[-90,-180],[90,180]]] };
+      ws.send(JSON.stringify(msg));
+    });
+
+    ws.on("message", (buf) => {
+      try {
+        const data = JSON.parse(buf.toString());
+        const match = predicate(data);
+        if (match) { clearTimeout(timer); finish(match); }
+      } catch { /* ignora pacotes inválidos */ }
+    });
+    ws.on("error", () => finish(null));
+    ws.on("close", () => finish(null));
+  });
+}
+
+// ---- API principal: IMO -> dados
+export async function fetchByIMO(apiKey: string, imoWant: string, waitMs = 60000): Promise<NormalizedVessel | null> {
+  // 1) escuta ShipStaticData até achar o IMO desejado (até 60s por padrão)
+  const staticHit = await waitUntil(apiKey, (m) => {
+    const s = parseStatic(m);
+    if (!s || !s.imo) return null;
+    if (String(s.imo) !== String(imoWant)) return null;
+
+    const v: NormalizedVessel = {
+      vesselName: s.vesselName,
+      imo: s.imo,
+      mmsi: s.mmsi,
+      flag: s.mmsi ? flagFromMMSI(s.mmsi) : null,
+      generalType: s.generalType,
+      detailedType: s.detailedType,
+      departedFrom: null,
+      arrivalAt: s.arrivalAt,
+      navStatus: null,
+      atd: null,
+      ata: null,
+      reportedEta: s.reportedEta,
+      source: "AISStream",
+      fetchedAt: new Date().toISOString()
+    };
+    return v;
+  }, waitMs);
 
   if (!staticHit || !staticHit.mmsi) return staticHit ?? null;
 
-  // 2) Pega NavigationalStatus filtrando por MMSI
-  const nav = await waitUntil(
-    apiKey,
-    { FiltersShipMMSI: [staticHit.mmsi], FilterMessageTypes: ["PositionReport"] },
-    (m) => {
-      const n = parsePosition(m);
-      return n ? n : null;
-    },
-    8000
-  );
+  // 2) em seguida tenta pegar NavigationalStatus (até 10s)
+  const nav = await waitUntil(apiKey, (m) => {
+    const txt = parsePosition(m);
+    return txt ? txt : null;
+  }, 10000);
 
   return nav ? { ...staticHit, navStatus: nav } : staticHit;
 }
