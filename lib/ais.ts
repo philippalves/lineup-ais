@@ -1,4 +1,4 @@
-// lib/ais.ts
+// lib/ais.ts — VERSÃO ROBUSTA
 import WebSocket from "ws";
 import { flagFromMMSI } from "./mid.js";
 import { mapShipTypeToText } from "./shiptype.js";
@@ -22,50 +22,19 @@ export type NormalizedVessel = {
 
 const WSS = "wss://stream.aisstream.io/v0/stream";
 
-// Conecta ao AISStream com bounding box global e (opcional) filtros.
-// Retorna a primeira mensagem que passar no predicate, ou null se der timeout.
-async function waitForMessage<T>(
-  apiKey: string,
-  subscribe: Record<string, any>,
-  predicate: (m: any) => T | null,
-  timeoutMs = 10_000
-): Promise<T | null> {
-  return new Promise((resolve) => {
-    const ws = new WebSocket(WSS);
-    let done = false;
-    const finish = (val: T | null) => {
-      if (done) return;
-      done = true;
-      try { ws.close(); } catch {}
-      resolve(val);
-    };
-    const t = setTimeout(() => finish(null), timeoutMs);
-
-    ws.on("open", () => {
-      const msg = {
-        APIKey: apiKey,
-        BoundingBoxes: [[[-90, -180], [90, 180]]], // mundo inteiro
-        ...subscribe
-      };
-      ws.send(JSON.stringify(msg));
-    });
-
-    ws.on("message", (buf) => {
-      try {
-        const data = JSON.parse(buf.toString());
-        const res = predicate(data);
-        if (res) {
-          clearTimeout(t);
-          finish(res);
-        }
-      } catch { /* ignora pacote inválido */ }
-    });
-
-    ws.on("error", () => finish(null));
-    ws.on("close", () => finish(null));
-  });
+// -------- utils
+function pad2(n: number){ return n<10?`0${n}`:`${n}`; }
+function formatEta(eta: any): string | null {
+  if (!eta) return null;
+  if (typeof eta === "string") return eta;
+  const y = new Date().getUTCFullYear();
+  const MM = Number(eta.Month ?? eta.month);
+  const DD = Number(eta.Day ?? eta.day);
+  const HH = Number(eta.Hour ?? eta.hour);
+  const MI = Number(eta.Minute ?? eta.minute);
+  if ([MM,DD,HH,MI].some(Number.isNaN)) return null;
+  return `${y}-${pad2(MM)}-${pad2(DD)}T${pad2(HH)}:${pad2(MI)}:00Z`;
 }
-
 function navStatusText(code: any): string | null {
   const c = Number(code);
   const map: Record<number,string> = {
@@ -76,76 +45,131 @@ function navStatusText(code: any): string | null {
   if (Number.isNaN(c)) return typeof code === "string" ? code : null;
   return map[c] ?? `Code ${c}`;
 }
-function pad2(n: number){ return n<10?`0${n}`:`${n}`; }
-function formatEta(eta: any): string | null {
-  if (!eta) return null;
-  if (typeof eta === "string") return eta;
-  const y = new Date().getUTCFullYear();
-  const mm = Number(eta.Month ?? eta.month);
-  const dd = Number(eta.Day ?? eta.day);
-  const hh = Number(eta.Hour ?? eta.hour);
-  const mi = Number(eta.Minute ?? eta.minute);
-  if ([mm,dd,hh,mi].some(Number.isNaN)) return null;
-  return `${y}-${pad2(mm)}-${pad2(dd)}T${pad2(hh)}:${pad2(mi)}:00Z`;
+
+// -------- assinatura genérica no stream
+function subscribe(ws: WebSocket, apiKey: string, extra: Record<string, any> = {}) {
+  // Colocamos a key na query (ao abrir) e também no corpo abaixo,
+  // porque alguns exemplos do AISStream aceitam "Apikey" e outros "APIKey".
+  const msg = {
+    Apikey: apiKey,
+    APIKey: apiKey,
+    BoundingBoxes: [[[-90,-180],[90,180]]],
+    ...extra
+  };
+  ws.send(JSON.stringify(msg));
 }
 
-// Resolve por IMO (procura ShipStaticData com mesmo ImoNumber).
-export async function fetchByIMO(apiKey: string, imo: string): Promise<NormalizedVessel | null> {
-  const staticHit = await waitForMessage(
+// -------- aguarda mensagens até bater o predicate (ou timeout)
+async function waitUntil<T>(
+  apiKey: string,
+  extraSubscribe: Record<string, any>,
+  predicate: (m: any) => T | null,
+  timeoutMs = 15000
+): Promise<T | null> {
+  return new Promise((resolve) => {
+    // importa a key também na URL (compatibilidade)
+    const ws = new WebSocket(`${WSS}?apikey=${encodeURIComponent(apiKey)}`);
+    let done = false;
+    const finish = (val: T | null) => { if (done) return; done = true; try{ws.close();}catch{} resolve(val); };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    ws.on("open", () => subscribe(ws, apiKey, extraSubscribe));
+    ws.on("message", (buf) => {
+      try {
+        const data = JSON.parse(buf.toString());
+        const match = predicate(data);
+        if (match) { clearTimeout(timer); finish(match); }
+      } catch { /* ignora pacotes inválidos */ }
+    });
+    ws.on("error", () => finish(null));
+    ws.on("close", () => finish(null));
+  });
+}
+
+// -------- parser defensivo
+function parseStatic(msg: any) {
+  const type = msg?.MessageType || msg?.messageType;
+  if (String(type).toLowerCase() !== "shipstaticdata") return null;
+
+  const md = msg?.MetaData || msg?.Metadata || {};
+  const body =
+    msg?.Message?.ShipStaticData ||
+    msg?.Message?.ShipStaticDataExtended ||
+    msg?.ShipStaticData ||
+    msg?.ShipStaticDataExtended ||
+    msg?.Message ||
+    {};
+
+  const imo = String(body?.ImoNumber ?? body?.IMO ?? body?.ImoNo ?? "");
+  const mmsi = String(md?.MMSI ?? body?.UserID ?? body?.MMSI ?? "");
+  const name = body?.Name ?? md?.ShipName ?? null;
+  const shipType = Number(body?.Type ?? body?.ShipType ?? NaN);
+  const dest = body?.Destination ?? null;
+  const eta = formatEta(body?.Eta ?? body?.ETA);
+
+  const { general, detailed } = mapShipTypeToText(Number.isNaN(shipType) ? undefined : shipType);
+
+  return {
+    imo: imo || null,
+    mmsi: mmsi || null,
+    vesselName: name ?? null,
+    generalType: general ?? null,
+    detailedType: detailed ?? null,
+    arrivalAt: dest || null,
+    reportedEta: eta ?? null
+  };
+}
+
+function parsePosition(msg: any) {
+  const type = msg?.MessageType || msg?.messageType;
+  if (String(type).toLowerCase() !== "positionreport") return null;
+  const body = msg?.Message?.PositionReport || msg?.PositionReport || {};
+  return navStatusText(body?.NavigationalStatus);
+}
+
+// -------- API principal: IMO -> dados
+export async function fetchByIMO(apiKey: string, imoWant: string): Promise<NormalizedVessel | null> {
+  // 1) ShipStaticData com o IMO pedido
+  const staticHit = await waitUntil(
     apiKey,
     { FilterMessageTypes: ["ShipStaticData"] },
     (m) => {
-      const type = m?.MessageType;
-      if (type !== "ShipStaticData") return null;
-      // Alguns payloads usam MetaData, outros Metadata
-      const metadata = m?.MetaData || m?.Metadata || {};
-      const body = m?.Message?.ShipStaticData || m?.Message?.ShipStaticDataExtended || {};
-      const foundImo = String(body?.ImoNumber ?? "");
-      if (!foundImo || foundImo !== String(imo)) return null;
-
-      const mmsi = String(metadata?.MMSI ?? body?.UserID ?? "");
-      const name = body?.Name ?? metadata?.ShipName ?? null;
-      const { general, detailed } = mapShipTypeToText(Number(body?.Type));
-      const dest = body?.Destination ?? null;
-      const eta = formatEta(body?.Eta);
-
-      const vessel: NormalizedVessel = {
-        vesselName: name ?? null,
-        imo: foundImo || null,
-        mmsi: mmsi || null,
-        flag: flagFromMMSI(mmsi),
-        generalType: general ?? null,
-        detailedType: detailed ?? null,
-        departedFrom: null,       // sem port-calls no AIS puro
-        arrivalAt: dest || null,  // Destination do AIS
-        navStatus: null,          // vamos tentar obter no passo 2
+      const s = parseStatic(m);
+      if (!s || !s.imo) return null;
+      if (String(s.imo) !== String(imoWant)) return null;
+      const v: NormalizedVessel = {
+        vesselName: s.vesselName,
+        imo: s.imo,
+        mmsi: s.mmsi,
+        flag: s.mmsi ? flagFromMMSI(s.mmsi) : null,
+        generalType: s.generalType,
+        detailedType: s.detailedType,
+        departedFrom: null,
+        arrivalAt: s.arrivalAt,
+        navStatus: null,
         atd: null,
         ata: null,
-        reportedEta: eta,
+        reportedEta: s.reportedEta,
         source: "AISStream",
         fetchedAt: new Date().toISOString()
       };
-      return vessel;
+      return v;
     },
-    10000
+    20000 // espera até 20s para achar o IMO certo
   );
 
   if (!staticHit || !staticHit.mmsi) return staticHit ?? null;
 
-  // Passo 2: pega NavigationalStatus via PositionReport filtrando pelo MMSI encontrado
-  const pos = await waitForMessage(
+  // 2) Pega NavigationalStatus filtrando por MMSI
+  const nav = await waitUntil(
     apiKey,
     { FiltersShipMMSI: [staticHit.mmsi], FilterMessageTypes: ["PositionReport"] },
     (m) => {
-      if (m?.MessageType !== "PositionReport") return null;
-      const body = m?.Message?.PositionReport || {};
-      return navStatusText(body?.NavigationalStatus) || ""; // só pra considerar "truthy"
+      const n = parsePosition(m);
+      return n ? n : null;
     },
-    6000
+    8000
   );
 
-  if (pos) {
-    return { ...staticHit, navStatus: pos as string };
-  }
-  return staticHit;
+  return nav ? { ...staticHit, navStatus: nav } : staticHit;
 }
